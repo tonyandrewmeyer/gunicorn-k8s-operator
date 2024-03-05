@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from ops import pebble, testing
+from ops.charm import RelationMeta, RelationRole
 from ops.model import ActiveStatus, BlockedStatus
 from scenario import (  # pylint: disable=import-error
     JUJU_DEFAULT_CONFIG,
@@ -227,55 +228,6 @@ class TestGunicornK8sCharm(unittest.TestCase):  # pylint: disable=too-many-publi
                 result = self.harness.charm._render_template(values["tmpl"], values["ctx"])
                 self.assertEqual(result, values["expected"])
 
-    def test_get_context_from_relations(self):
-        """
-        arrange: given the deployed charm with relations
-        act: execute _get_content_from relations
-        assert: the output and logs are correct
-        """
-        self.harness.disable_hooks()  # no need for hooks to fire for this test
-
-        # Set up PG "special case" relation data
-        reldata = self.harness.charm._stored.reldata
-        reldata["pg"] = {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI}
-
-        # Set up PG "raw" relation data
-        relation_id = self.harness.add_relation("pg", "postgresql")
-        self.harness.add_relation_unit(relation_id, "postgresql/0")
-        self.harness.update_relation_data(relation_id, "postgresql/0", {"version": "10"})
-
-        # Set up random relation, with 2 units
-        relation_id = self.harness.add_relation("myrel", "myapp")
-        self.harness.add_relation_unit(relation_id, "myapp/0")
-        self.harness.add_relation_unit(relation_id, "myapp/1")
-        self.harness.update_relation_data(relation_id, "myapp/0", {"thing": "bli"})
-        self.harness.update_relation_data(relation_id, "myapp/1", {"thing": "blo"})
-
-        # Set up same relation but with a different app
-        relation_id = self.harness.add_relation("myrel", "myapp2")
-        self.harness.add_relation_unit(relation_id, "myapp2/0")
-        self.harness.update_relation_data(relation_id, "myapp2/0", {"thing": "blu"})
-
-        # Set up random relation, no unit (can happen during relation init)
-        relation_id = self.harness.add_relation("myrel2", "myapp2")
-
-        expected_ret = {
-            "pg": {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI, "version": "10"},
-            "myrel": {"thing": "bli"},
-        }
-        expected_logger = [
-            'WARNING:charm:Multiple relations of type "myrel" detected, '
-            "using only the first one (id: 1) for relation data.",
-            'WARNING:charm:Multiple units detected in the relation "myrel:1", '
-            "using only the first one (id: myapp/0) for relation data.",
-        ]
-
-        with self.assertLogs(level="WARNING") as logger:
-            result = self.harness.charm._get_context_from_relations()
-
-        self.assertEqual(sorted(logger.output), sorted(expected_logger))
-        self.assertEqual(result, expected_ret)
-
     def test_validate_yaml_proper_type_proper_yaml(self):
         """
         arrange: given a correct yaml
@@ -376,32 +328,6 @@ class TestGunicornK8sCharm(unittest.TestCase):  # pylint: disable=too-many-publi
         self.harness.update_config(JUJU_DEFAULT_CONFIG)
         self.harness.update_config({"environment": "a: b"})
         expected_ret = {"a": "b"}
-
-        result = self.harness.charm._make_pod_env()
-        self.assertEqual(result, expected_ret)
-
-    def test_make_pod_env_proper_env_temp_rel(self):
-        """
-        arrange: given the deployed charm
-        act: try to update the config and add relations
-        assert: the output config is correct
-        """
-        # Proper env with templating/relations
-        self.harness.update_config(JUJU_DEFAULT_CONFIG)
-        self.harness.update_config({"environment": "DB: {{pg.db_uri}}\nTHING: {{myrel.thing}}}"})
-        expected_ret = {"a": "b"}
-
-        # Set up PG relation
-        reldata = self.harness.charm._stored.reldata
-        reldata["pg"] = {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI}
-
-        # Set up random relation
-        self.harness.disable_hooks()  # no need for hooks to fire for this test
-        relation_id = self.harness.add_relation("myrel", "myapp")
-        self.harness.add_relation_unit(relation_id, "myapp/0")
-        self.harness.update_relation_data(relation_id, "myapp/0", {"thing": "bli"})
-
-        expected_ret = {"DB": TEST_PG_URI, "THING": "bli}"}
 
         result = self.harness.charm._make_pod_env()
         self.assertEqual(result, expected_ret)
@@ -570,6 +496,125 @@ class TestGunicornK8sCharm(unittest.TestCase):  # pylint: disable=too-many-publi
         self.assertEqual(
             self.harness.charm._flatten_dict(test_dict, parent_key="test.", sep="_"), expected_dict
         )
+
+
+class TestGunicornK8sCharmExtraRels(unittest.TestCase):
+    """Class for charm testing with additional relations.
+
+    Attrs:
+        maxDiff: Full diff when there is an error.
+    """
+
+    maxDiff = None
+
+    def setUp(self):
+        """Setup the harness object."""
+        self.harness = testing.Harness(GunicornK8sCharm, meta="""
+name: gunicorn-k8s
+containers:
+  gunicorn:
+    resource: gunicorn-image
+provides:
+  metrics-endpoint:
+    interface: prometheus_scrape
+  grafana-dashboard:
+    interface: grafana_dashboard
+requires:
+  pg:
+    interface: pgsql
+    limit: 1
+  ingress:
+    interface: ingress
+  logging:
+    interface: loki_push_api
+  mongodb_client:
+    interface: mongodb_client
+    limit: 1
+  myrel:
+    interface: myapp
+  myrel2:
+    interface: myapp2
+""")
+        self.harness.begin()
+
+    def tearDown(self):
+        """Cleanup the harness."""
+        self.harness.cleanup()
+
+    def test_make_pod_env_proper_env_temp_rel(self):
+        """
+        arrange: given the deployed charm
+        act: try to update the config and add relations
+        assert: the output config is correct
+        """
+        # Proper env with templating/relations
+        self.harness.update_config(JUJU_DEFAULT_CONFIG)
+        self.harness.update_config({"environment": "DB: {{pg.db_uri}}\nTHING: {{myrel.thing}}}"})
+        expected_ret = {"a": "b"}
+
+        # Set up PG relation
+        reldata = self.harness.charm._stored.reldata
+        reldata["pg"] = {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI}
+
+        # Set up random relation
+        self.harness.disable_hooks()  # no need for hooks to fire for this test
+        relation_id = self.harness.add_relation("myrel", "myapp")
+        self.harness.add_relation_unit(relation_id, "myapp/0")
+        self.harness.update_relation_data(relation_id, "myapp/0", {"thing": "bli"})
+
+        expected_ret = {"DB": TEST_PG_URI, "THING": "bli}"}
+
+        result = self.harness.charm._make_pod_env()
+        self.assertEqual(result, expected_ret)
+
+    def test_get_context_from_relations(self):
+        """
+        arrange: given the deployed charm with relations
+        act: execute _get_content_from relations
+        assert: the output and logs are correct
+        """
+        self.harness.disable_hooks()  # no need for hooks to fire for this test
+
+        # Set up PG "special case" relation data
+        reldata = self.harness.charm._stored.reldata
+        reldata["pg"] = {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI}
+
+        # Set up PG "raw" relation data
+        relation_id = self.harness.add_relation("pg", "postgresql")
+        self.harness.add_relation_unit(relation_id, "postgresql/0")
+        self.harness.update_relation_data(relation_id, "postgresql/0", {"version": "10"})
+
+        # Set up random relation, with 2 units
+        relation_id = self.harness.add_relation("myrel", "myapp")
+        self.harness.add_relation_unit(relation_id, "myapp/0")
+        self.harness.add_relation_unit(relation_id, "myapp/1")
+        self.harness.update_relation_data(relation_id, "myapp/0", {"thing": "bli"})
+        self.harness.update_relation_data(relation_id, "myapp/1", {"thing": "blo"})
+
+        # Set up same relation but with a different app
+        relation_id = self.harness.add_relation("myrel", "myapp2")
+        self.harness.add_relation_unit(relation_id, "myapp2/0")
+        self.harness.update_relation_data(relation_id, "myapp2/0", {"thing": "blu"})
+
+        # Set up random relation, no unit (can happen during relation init)
+        relation_id = self.harness.add_relation("myrel2", "myapp2")
+
+        expected_ret = {
+            "pg": {"conn_str": TEST_PG_CONNSTR, "db_uri": TEST_PG_URI, "version": "10"},
+            "myrel": {"thing": "bli"},
+        }
+        expected_logger = [
+            'WARNING:charm:Multiple relations of type "myrel" detected, '
+            "using only the first one (id: 1) for relation data.",
+            'WARNING:charm:Multiple units detected in the relation "myrel:1", '
+            "using only the first one (id: myapp/0) for relation data.",
+        ]
+
+        with self.assertLogs(level="WARNING") as logger:
+            result = self.harness.charm._get_context_from_relations()
+
+        self.assertEqual(sorted(logger.output), sorted(expected_logger))
+        self.assertEqual(result, expected_ret)
 
     def test_on_show_environment_context_action(self):
         """
